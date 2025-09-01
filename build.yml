@@ -1,0 +1,91 @@
+name: Build TWRP for SM-M135FU from boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      mediafire_link:
+        description: "Paste your MediaFire link to boot.img (e.g. https://www.mediafire.com/file/xxx/boot.img/file)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+
+    steps:
+    - name: ✅ Checkout
+      uses: actions/checkout@v3
+
+    - name: 🧰 Install base deps
+      run: |
+        sudo apt update
+        sudo apt install -y git-core gnupg flex bison build-essential zip curl aria2           zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev           x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils           xsltproc unzip fontconfig python3 python3-pip openjdk-11-jdk
+        mkdir -p "$HOME/bin"
+        curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+        chmod a+x "$HOME/bin/repo"
+        echo "$HOME/bin" >> $GITHUB_PATH
+
+    - name: 📥 Download boot.img from MediaFire (resolve direct URL)
+      env:
+        LINK: ${{ inputs.mediafire_link }}
+      run: |
+        set -e
+        mkdir -p work/input && cd work/input
+        # Fetch the HTML and extract the real download endpoint
+        REAL_URL=$(curl -sL "$LINK" | grep -Eo 'https://download[^"]+')
+        echo "Resolved URL: $REAL_URL"
+        curl -L --fail --retry 5 -o boot.img "$REAL_URL"
+        ls -lh boot.img
+
+    - name: 🧪 Generate device tree from boot.img (twrpdtgen)
+      run: |
+        set -e
+        git clone https://github.com/SebaUbuntu/TWRP-device-tree-generator.git twrpdtgen
+        python3 -m pip install --upgrade pip
+        pip3 install sebaubuntu_libs lz4 pycryptodome
+        cd twrpdtgen
+        python3 -m twrpdtgen ../work/input/boot.img
+        echo "Generated trees under: $(pwd)/output"
+        find output -maxdepth 3 -type f -name 'BoardConfig.mk' -print
+
+    - name: 📂 Detect generated tree path
+      id: detect_tree
+      run: |
+        TREE_DIR=$(find twrpdtgen/output/device -maxdepth 2 -mindepth 2 -type d | head -n1)
+        echo "tree_dir=$TREE_DIR" >> $GITHUB_OUTPUT
+        BRAND=$(basename "$(dirname "$TREE_DIR")")
+        CODENAME=$(basename "$TREE_DIR")
+        echo "brand=$BRAND" >> $GITHUB_OUTPUT
+        echo "codename=$CODENAME" >> $GITHUB_OUTPUT
+
+    - name: 🌐 Sync TWRP source (twrp-12.1)
+      run: |
+        set -e
+        mkdir twrp && cd twrp
+        repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-12.1
+        repo sync -j$(nproc) --force-sync
+
+    - name: ➕ Add generated device tree to source
+      run: |
+        set -e
+        BRAND='${{ steps.detect_tree.outputs.brand }}'
+        CODENAME='${{ steps.detect_tree.outputs.codename }}'
+        mkdir -p twrp/device/"$BRAND"
+        cp -r twrpdtgen/output/device/"$BRAND"/"$CODENAME" twrp/device/"$BRAND"/
+
+    - name: 🏗️ Build recovery
+      run: |
+        set -e
+        CODENAME='${{ steps.detect_tree.outputs.codename }}'
+        cd twrp
+        source build/envsetup.sh
+        lunch omni_${CODENAME}-eng || lunch twrp_${CODENAME}-eng || lunch omni_m135fu-eng
+        mka recoveryimage
+
+    - name: 📦 Upload artifacts (recovery + device tree)
+      uses: actions/upload-artifact@v3
+      with:
+        name: twrp-${{ steps.detect_tree.outputs.codename }}
+        path: |
+          twrp/out/target/product/${{ steps.detect_tree.outputs.codename }}/recovery.img
+          twrpdtgen/output/**
